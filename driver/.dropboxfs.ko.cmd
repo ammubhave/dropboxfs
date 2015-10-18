@@ -1,0 +1,1 @@
+cmd_/home/ambhave/dropboxfs/driver/dropboxfs.ko := ld -r -m elf_x86_64 -T ./scripts/module-common.lds --build-id  -o /home/ambhave/dropboxfs/driver/dropboxfs.ko /home/ambhave/dropboxfs/driver/dropboxfs.o /home/ambhave/dropboxfs/driver/dropboxfs.mod.o

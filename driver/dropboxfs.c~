@@ -1,0 +1,295 @@
+#include <linux/module.h>
+#include <linux/moduleparam.h>
+#include <linux/init.h>
+
+#include <linux/sched.h>
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/fs.h>
+#include <linux/errno.h>
+#include <linux/types.h>
+#include <linux/fcntl.h>
+#include <linux/hdreg.h>
+#include <linux/kdev_t.h>
+#include <linux/vmalloc.h>
+#include <linux/genhd.h>
+#include <linux/blkdev.h>
+#include <linux/buffer_head.h>
+#include <linux/bio.h>
+#include <linux/elevator.h>
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Amol Bhave");
+
+static int dropboxfs_major = 0;
+module_param(dropboxfs_major, int, 0);
+static int logical_block_size = 512;
+module_param(logical_block_size, int, 0);
+static int nsectors = 1024;
+module_param(nsectors, int, 0);
+
+#define DEVICE_NAME "dropbox"
+#define KERNEL_SECTOR_SIZE	512
+
+static struct request_queue *Queue;
+
+struct dropboxfs_device {
+	unsigned long size;
+	spinlock_t lock;
+	u8 *data;
+	struct gendisk *gd;
+} Device;
+
+/*static short int myshort = 1;
+static int myint = 420;
+static long int mylong = 9999;
+static char *mystring = "blah";
+static int myintArray[2] = { -1, -1 };
+static int arr_argc = 0;
+
+ 
+ * module_param(foo, int, 0000)
+ * The first param is the parameters name
+ * The second param is it's data type
+ * The final argument is the permissions bits, 
+ * for exposing parameters in sysfs (if non-zero) at a later stage.
+ *
+
+module_param(myshort, short, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+MODULE_PARM_DESC(myshort, "A short integer");
+module_param(myint, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+MODULE_PARM_DESC(myint, "An integer");
+module_param(mylong, long, S_IRUSR);
+MODULE_PARM_DESC(mylong, "A long integer");
+module_param(mystring, charp, 0000);
+MODULE_PARM_DESC(mystring, "A character string");*/
+
+/* 
+ * Global variables are declared as static, so are global within the file. 
+ */
+
+static int Device_Open = 0;
+
+static int dropboxfs_open(struct block_device *dev, fmode_t fmode)
+{
+	if (Device_Open)
+		return -EBUSY;
+
+	Device_Open++;
+	try_module_get(THIS_MODULE);
+
+	return 0;
+}
+
+/* 
+ * Called when a process closes the device file.
+ */
+static void dropboxfs_release(struct gendisk *disk, fmode_t fmode)
+{
+	Device_Open--;		/* We're now ready for our next caller */
+
+	/* 
+	 * Decrement the usage count, or else once you opened the file, you'll
+	 * never get get rid of the module. 
+	 */
+	module_put(THIS_MODULE);
+}
+
+static void dropboxfs_subprocessinfo_cleanup(struct subprocess_info *info)
+{
+	if (info->argv[5])
+		kfree(info->argv[5]);
+	kfree(info->argv[4]);
+	kfree(info->argv[3]);
+	kfree(info->argv);
+	kfree(info->envp);
+	//kfree(info);
+	/*if (info->argv[4])
+		kfree(info->argv[4]);
+	kfree(info->argv[3]);
+
+	if (info && info->argv)
+		printk (KERN_ALERT "dbxfs: cleanup: 3: %p 4: %p info: %p argv: %p envp: %p", info->argv[3], info->argv[4], info, info->argv, info->envp);
+	else if (info)
+		printk (KERN_ALERT "dbxfs: cleanup: info: %p, argv: %p", info, info->argv);
+	else
+		printk (KERN_ALERT "dbxfs: cleanup: info: %p", info);*/
+}
+
+static void dropboxfs_transfer(struct dropboxfs_device *dev, sector_t sector,
+		unsigned long nsect, char *buffer, int write) {
+	unsigned long offset = sector * logical_block_size;
+	unsigned long nbytes = nsect * logical_block_size;
+	char **argv, **envp;
+	struct subprocess_info *info;
+
+	if ((offset + nbytes) > dev->size) {
+		printk (KERN_NOTICE "dropboxfs: Beyond-end write (%ld %ld)\n", offset, nbytes);
+		return;
+	}
+
+	/*
+	if (write)
+		memcpy(dev->data + offset, buffer, nbytes);
+	else
+		memcpy(buffer, dev->data + offset, nbytes);*/
+	argv = kmalloc(sizeof(char*)*6, GFP_ATOMIC);
+	envp = kmalloc(sizeof(char*)*4, GFP_ATOMIC);
+	argv[0] = "/usr/bin/python2";
+	argv[1] = "/home/ambhave/dropboxfs/front.py";
+	argv[3] = kmalloc(11, GFP_ATOMIC);
+	sprintf(argv[3], "%ld", sector);
+	argv[4] = kmalloc(11, GFP_ATOMIC);
+	sprintf(argv[4], "%ld", nsect);
+	
+	if (write) {
+		char *src = buffer;
+		char *dst = argv[2];
+		unsigned long i;
+		argv[2] = "w";
+		argv[5] = kmalloc(sizeof(char) * 2 * nbytes, GFP_ATOMIC);
+		for (i = 0; i < nbytes; i++) {
+			if (*src == '\0') {
+				*dst++ = '\\';
+				*dst++ = '0';
+				src++;
+			} else if (*src == '\\') {
+				*dst++ = '\\';
+				*dst++ = *src++;
+			} else
+				*dst++ = *src++;
+		}
+		*dst = '\0';
+
+		argv[6] = NULL;
+	} else {
+		argv[2] = "r";
+		argv[5] = NULL;
+
+		memcpy(buffer, "dAtA", 5);
+	}
+
+
+	envp[0] = "HOME=/";
+	envp[1] = "TERM=linux";
+	envp[2] = "PATH=/sbin:/usr/sbin:/bin:/usr/bin";
+	envp[3] = NULL;
+
+	info = call_usermodehelper_setup(argv[0], argv, envp, GFP_ATOMIC, NULL, dropboxfs_subprocessinfo_cleanup, NULL);
+
+	call_usermodehelper_exec(info, UMH_NO_WAIT);
+
+	//printk (KERN_ALERT "dbxfs: request: 3: %p 4: %p info: %p argv: %p envp: %p", info->argv[3], info->argv[4], info, info->argv, info->envp);
+
+	//if (info->argv[4])
+	//	kfree(info->argv[4]);
+	//kfree(info->argv[3]);
+}
+
+static void dropboxfs_request(struct request_queue *q)
+{
+	struct request *req;
+
+	req = blk_fetch_request(q);
+	while (req != NULL) {
+		if (req->cmd_type != REQ_TYPE_FS) {
+			printk (KERN_NOTICE "Skip non-fs request\n");
+			__blk_end_request_all(req, -EIO);
+			req = blk_fetch_request(q);
+			continue;
+		}
+
+		dropboxfs_transfer(&Device, blk_rq_pos(req), blk_rq_cur_sectors(req),
+				bio_data(req->bio), rq_data_dir(req));
+
+		printk (KERN_NOTICE "Req dir %d pos %ld, nr %d \n",
+						  rq_data_dir(req),
+						  blk_rq_pos(req), blk_rq_cur_sectors(req));
+
+		if ( ! __blk_end_request_cur(req, 0) ) {
+			req = blk_fetch_request(q);
+		}
+	}
+}
+
+int dropboxfs_revalidate_disk(struct gendisk *gd)
+{
+	return 0;
+}
+
+struct block_device_operations bdops = {
+	.owner 				= THIS_MODULE,
+	.open 				= dropboxfs_open,
+	.release 			= dropboxfs_release,
+	.media_changed 		= NULL,
+	.revalidate_disk 	= dropboxfs_revalidate_disk,
+};
+
+static int __init dropboxfs_init(void)
+{
+	Device.size = nsectors * logical_block_size;
+	spin_lock_init(&Device.lock);
+	Device.data = vmalloc(Device.size);
+	if (Device.data == NULL)
+		return -ENOMEM;
+
+	Queue = blk_init_queue(dropboxfs_request, &Device.lock);
+	if (Queue == NULL)
+		goto out;
+
+	dropboxfs_major = register_blkdev(0, DEVICE_NAME);
+	if (dropboxfs_major < 0) {
+	  printk(KERN_ALERT "Registering block device failed with %d\n", dropboxfs_major);
+	  return -EBUSY;
+	}
+
+	blk_queue_logical_block_size(Queue, logical_block_size);
+
+	Device.gd = alloc_disk(16);
+	if (!Device.gd)
+		goto out_unregister;
+
+	Device.gd->major = dropboxfs_major;
+	Device.gd->first_minor = 0;
+	Device.gd->fops = &bdops;
+	Device.gd->private_data = &Device;
+	strcpy(Device.gd->disk_name, "dropbox0");
+	set_capacity(Device.gd, nsectors*(logical_block_size/KERNEL_SECTOR_SIZE));
+	Device.gd->queue = Queue;
+	add_disk(Device.gd);
+
+	printk(KERN_INFO "I was assigned major number %d. To talk to\n", dropboxfs_major);
+	printk(KERN_INFO "the driver, create a dev file with\n");
+	printk(KERN_INFO "'mknod /dev/%s b %d 0'.\n", DEVICE_NAME, dropboxfs_major);
+	printk(KERN_INFO "Try various minor numbers. Try to cat and echo to\n");
+	printk(KERN_INFO "the device file.\n");
+	printk(KERN_INFO "Remove the device file and module when done.\n");
+
+	return 0;
+
+out_unregister:
+	unregister_blkdev(dropboxfs_major, DEVICE_NAME);
+out:
+	vfree(Device.data);
+	return -ENOMEM;
+}
+
+static void dropboxfs_exit(void)
+{
+	/* 
+	 * Unregister the device 
+	 */
+	if (Device.gd) {
+		del_gendisk(Device.gd);
+		put_disk(Device.gd);
+	}
+	unregister_blkdev(dropboxfs_major, DEVICE_NAME);
+	if (Queue) {
+		blk_cleanup_queue(Queue);
+	}
+	if (Device.data) 
+		vfree(Device.data);
+}
+
+module_init(dropboxfs_init);
+module_exit(dropboxfs_exit);
